@@ -1,0 +1,281 @@
+---
+title: "NNModel_cellfrequency"
+output: html_document
+date: "2024-11-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(neuralnet)
+```
+
+```{r}
+h_data = readRDS("/scratch/PVP/CMI-PB/data/harmonized/master_harmonized_data.RDS")
+training_data = h_data$training
+clinical_training = training_data$subject_specimen%>%as.data.frame()
+testing_data = h_data$challenge
+clinical_testing  = testing_data$subject_specimen%>%as.data.frame()
+```
+
+```{r}
+cf_training = training_data$pbmc_cell_frequency$wide
+dim(cf_training)
+sum(is.na(cf_training))
+library(impute)
+library(purrr)
+library(dplyr)
+normalized_imputed = cf_training[rowMeans(is.na(cf_training)) < 1, ] %>%
+    as.matrix() %>%
+    impute.knn() %>%
+    .$data%>%as.data.frame()
+
+clinical_training$specimen_id = as.numeric(clinical_training$specimen_id)
+normalized_imputed$specimen_id = as.numeric(normalized_imputed$specimen_id)
+list_df = list(normalized_imputed, clinical_training)
+df_merge <- list_df %>% purrr::reduce(full_join, by="specimen_id")
+TIMEPOINTS = c(-30,-15,0,1)
+df_merge <- df_merge[df_merge$timepoint %in% TIMEPOINTS, ]
+
+calculate_age <- function(birthdate, eventdate) {
+  age <- as.numeric(difftime(eventdate, birthdate, units = "weeks")) / 52.25
+  return(age)
+}
+
+df_merge$age_at_event <- mapply(calculate_age, df_merge$year_of_birth, df_merge$date_of_boost)
+
+df_pivot <- df_merge[, names(df_merge)!="specimen_id"] %>%
+  pivot_wider(id_cols=c("subject_id", "dataset", "biological_sex",
+                        "infancy_vac","age_at_event"),
+              names_from = timepoint,
+              values_from = colnames(normalized_imputed)[colnames(normalized_imputed) != "specimen_id"],
+              names_sep = "_D")
+```
+
+```{r}
+df_pivot <- df_pivot %>% mutate_if(is.character, as.factor)
+```
+
+```{r}
+safe_column_names <- function(col_names) {
+  col_names <- gsub("-", "_", col_names)   # Replace "-" with "_"
+  col_names <- gsub(" ", "_", col_names)   # Replace spaces with "_"
+  col_names <- gsub("\\(", "", col_names)  # Remove "("
+  col_names <- gsub("\\)", "", col_names)  # Remove ")"
+  col_names <- gsub("\\+", "_plus_", col_names)  # Replace "+" with "_plus_"
+  return(col_names)
+}
+df_pivot1 = df_pivot
+colnames(df_pivot1) <- safe_column_names(colnames(df_pivot1))
+
+numeric_columns <- sapply(df_pivot1, is.numeric)
+df_numeric <- df_pivot1[, numeric_columns]
+
+df_numeric_matrix <- as.matrix(df_numeric)
+
+imputed_data <- impute.knn(df_numeric_matrix, colmax = 1)
+
+imputed_df_numeric <- as.data.frame(imputed_data$data)
+
+df_pivot1[, numeric_columns] <- imputed_df_numeric
+
+feature_columns <- grep("D0", colnames(df_pivot1), value = TRUE)
+
+cleaned_feature <- gsub("_D[0-9]+", "", feature_columns)
+
+mean_df <- cleaned_feature %>%
+  lapply(function(feature) {
+   feature_d0 <- paste0(feature, "_D0")
+    feature_d15 <- paste0(feature, "_D_15")
+    feature_d30 <- paste0(feature, "_D_30")
+    
+    if (all(c(feature_d0, feature_d15, feature_d30) %in% colnames(df_pivot1))) {
+      mean_values <- rowMeans(df_pivot1[, c(feature_d0, feature_d15, feature_d30)], na.rm = TRUE)
+      mean_name <- paste0(feature, "_mean")
+      
+      # Return a data frame with mean column
+      return(data.frame(mean_name = mean_values))
+    } else {
+      return(NULL)
+    }
+  }) %>%
+  bind_cols()
+
+colnames(mean_df) <- sapply(cleaned_feature, function(feature) paste0(feature, "_mean"))
+
+df_pivot1 <- bind_cols(df_pivot1, mean_df)
+
+mean_columns <- grep("_mean$", colnames(df_pivot1), value = TRUE)
+print(mean_columns)
+print(head(df_pivot1[, mean_columns]))
+
+
+selected_columns <- c("biological_sex", "infancy_vac", "age_at_event", "Monocytes_D1", mean_columns)
+df_pivot_training <- df_pivot1[, selected_columns]
+df_pivot_training <- na.omit(df_pivot_training)
+df_pivot_training$biological_sex <- as.factor(df_pivot_training$biological_sex)
+df_pivot_training$infancy_vac <- as.factor(df_pivot_training$infancy_vac)
+df_pivot_training$biological_sex <- as.numeric(df_pivot_training$biological_sex) - 1
+df_pivot_training$infancy_vac <- as.numeric(df_pivot_training$infancy_vac) - 1
+
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+df_pivot_norm <- as.data.frame(lapply(df_pivot_training, normalize))
+
+
+train_data = df_pivot_norm
+formula <- as.formula(
+  paste("Monocytes_D1 ~ biological_sex + infancy_vac + age_at_event +", paste(mean_columns, collapse = " + "))
+)
+
+model <- neuralnet(
+  formula,
+  data = train_data,
+  hidden = c(5, 3),
+  linear.output = TRUE
+)
+```
+```{r}
+test_data = testing_data$pbmc_cell_frequency$wide
+dim(test_data)
+sum(is.na(test_data))
+normalized_imputed_test = test_data[rowMeans(is.na(test_data)) < 1, ] %>%
+    as.matrix() %>%
+    impute.knn() %>%
+    .$data%>%as.data.frame()
+
+clinical_testing$specimen_id = as.numeric(clinical_testing$specimen_id)
+normalized_imputed_test$specimen_id = as.numeric(normalized_imputed_test$specimen_id)
+list_df = list(normalized_imputed_test, clinical_testing)
+df_merge <- list_df %>% purrr::reduce(full_join, by="specimen_id")
+TIMEPOINTS = c(-30,-14,0)
+df_merge <- df_merge[df_merge$timepoint %in% TIMEPOINTS, ]
+df_merge$timepoint[df_merge$timepoint == -14] <- -15
+
+df_merge$age_at_event <- mapply(calculate_age, df_merge$year_of_birth, df_merge$date_of_boost)
+
+df_pivot_test <- df_merge[, names(df_merge)!="specimen_id"] %>%
+  pivot_wider(id_cols=c("subject_id", "dataset", "biological_sex",
+                        "infancy_vac","age_at_event"),
+              names_from = timepoint,
+              values_from = colnames(normalized_imputed_test)[colnames(normalized_imputed_test) != "specimen_id"],
+              names_sep = "_D")
+
+```
+
+```{r}
+df_pivot_test <- df_pivot_test %>% mutate_if(is.character, as.factor)
+```
+```{r}
+
+df_pivot2 = df_pivot_test
+
+colnames(df_pivot2) <- safe_column_names(colnames(df_pivot2))
+
+numeric_columns <- sapply(df_pivot2, is.numeric)
+df_numeric <- df_pivot2[, numeric_columns]
+
+df_numeric_matrix <- as.matrix(df_numeric)
+
+imputed_data <- impute.knn(df_numeric_matrix, colmax = 1)
+
+imputed_df_numeric <- as.data.frame(imputed_data$data)
+
+df_pivot2[, numeric_columns] <- imputed_df_numeric
+
+
+mean_df <- cleaned_feature %>%
+  lapply(function(feature) {
+   feature_d0 <- paste0(feature, "_D0")
+    feature_d15 <- paste0(feature, "_D_15")
+    feature_d30 <- paste0(feature, "_D_30")
+        if (all(c(feature_d0, feature_d15, feature_d30) %in% colnames(df_pivot2))) {
+      mean_values <- rowMeans(df_pivot2[, c(feature_d0, feature_d15, feature_d30)], na.rm = TRUE)
+      mean_name <- paste0(feature, "_mean")
+      
+      return(data.frame(mean_name = mean_values))
+    } else {
+      return(NULL)
+    }
+  }) %>%
+  bind_cols()
+
+colnames(mean_df) <- sapply(cleaned_feature, function(feature) paste0(feature, "_mean"))
+imputed_data <- impute.knn(as.matrix(mean_df))
+mean_df_imputed <- as.data.frame(imputed_data$data)
+df_pivot_test <- bind_cols(df_pivot2, mean_df_imputed)
+
+mean_columns <- grep("_mean$", colnames(df_pivot_test), value = TRUE)
+print(mean_columns)
+print(head(df_pivot_test[, mean_columns]))
+
+
+selected_columns <- c("subject_id","biological_sex", "infancy_vac", "age_at_event","Monocytes_D0", mean_columns)
+df_pivot_testing <- df_pivot_test[, selected_columns]
+
+
+
+df_pivot_testing$biological_sex <- as.factor(df_pivot_testing$biological_sex)
+df_pivot_testing$infancy_vac <- as.factor(df_pivot_testing$infancy_vac)
+df_pivot_testing$biological_sex <- as.numeric(df_pivot_testing$biological_sex) - 1
+df_pivot_testing$infancy_vac <- as.numeric(df_pivot_testing$infancy_vac) - 1
+
+normalize <- function(x) {
+  if (all(is.na(x))) {
+    return(rep(NA, length(x)))  
+  }
+  if (min(x, na.rm = TRUE) == max(x, na.rm = TRUE)) {
+    return(rep(0, length(x))) 
+  }
+  
+  range_val <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
+  if (range_val == 0) {
+    return(rep(0, length(x)))  
+  }
+  
+  return ((x - min(x, na.rm = TRUE)) / range_val)
+}
+
+df_pivot_norm <- as.data.frame(lapply(df_pivot_testing, normalize))
+
+test_data <- df_pivot_norm
+test_columns <- c("biological_sex", "infancy_vac", "age_at_event", mean_columns)
+nn_predictions <- compute(model, test_data[, test_columns])
+predicted_values <- nn_predictions$net.result
+nn_predictions_clipped <- pmax(pmin(predicted_values, 1), 0)
+
+original_min <- min(df_pivot_training$Monocytes_D1)  
+original_max <- max(df_pivot_training$Monocytes_D1)  
+
+denormalize <- function(normalized_x, original_min, original_max) {
+  return(normalized_x * (original_max - original_min) + original_min)
+}
+
+test_data$results <- denormalize(nn_predictions$net.result, original_min, original_max)
+if(any(test_data$results<0)){
+  test_data$results = test_data$results + abs(max(test_data$results)) +1
+}
+
+```
+```{r}
+original_subject_id <- df_pivot2$subject_id
+
+test_data$fold_change <- test_data$results / df_pivot2$Monocytes_D0
+ranked_data <- data.frame(
+  subject_id = original_subject_id,
+  rank_results = rank(-test_data$results),  
+  rank_fold_change = rank(-test_data$fold_change)  
+)
+
+print(ranked_data)
+ranked_data_CF = ranked_data
+save(ranked_data_CF, file = "~/CMI_CF.Rdata")
+```
+
+
